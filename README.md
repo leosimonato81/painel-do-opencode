@@ -25,7 +25,7 @@ Requer o OpenCode **2.3.0 ou mais novo**.
   <img src="docs/img/windows-celular.png" alt="Guia para configurar o celular, no Windows" width="358">
 </p>
 
-1. Baixe `Painel do OpenCode.exe` na página **Releases** deste repositório.
+1. Baixe `Painel.do.OpenCode.exe` na página **[Releases](../../releases/latest)**.
 2. Abra o arquivo. Na primeira vez, o Windows pode mostrar "O Windows protegeu o computador",
    o que acontece com todo app sem assinatura paga: clique em **Mais informações → Executar assim mesmo**.
 3. Para usar no celular:
@@ -63,25 +63,69 @@ powershell -ExecutionPolicy Bypass -File .\gerar-exe.ps1
   <img src="docs/img/linux-celular.png" alt="Guia para configurar o celular, no Linux" width="380">
 </p>
 
-Usa Python 3, GTK 4 e libadwaita, que já vêm no Ubuntu e no Fedora com GNOME.
+### Antes de instalar
+
+- O **OpenCode 2.3.0 ou mais novo**, instalado pelo instalador oficial
+  (`curl -fsSL https://opencode.ai/install | bash`). O painel usa o OpenCode em `~/.opencode/bin/opencode`.
+- Opcional: o **app de desktop do OpenCode**, só para a opção "Com interface" ao entrar no computador.
+
+### Ubuntu, Debian, Linux Mint, Pop!_OS e derivados (`.deb`)
+
+1. Baixe `opencode-painel_1.0_all.deb` na página **[Releases](../../releases/latest)**.
+2. Instale pelo terminal, na pasta onde o arquivo foi baixado (o `apt` instala o que mais for preciso):
+
+   ```bash
+   cd ~/Downloads
+   sudo apt install ./opencode-painel_1.0_all.deb
+   ```
+
+   Ou abra o arquivo com dois cliques, se o seu sistema tiver uma central de programas que instale `.deb`.
+3. Procure **"Painel do OpenCode"** no menu de aplicativos.
+
+Para desinstalar: `sudo apt remove opencode-painel`.
+
+### Fedora, Arch e outras distribuições
+
+1. Instale as dependências (Python 3, GTK 4 e libadwaita; no GNOME geralmente já vêm instaladas):
+
+   ```bash
+   sudo dnf install python3-gobject python3-cairo gtk4 libadwaita        # Fedora
+   sudo pacman -S python-gobject python-cairo gtk4 libadwaita            # Arch
+   ```
+
+2. Baixe o código e rode o instalador (instala só para o seu usuário, sem `sudo`):
+
+   ```bash
+   git clone https://github.com/leosimonato81/painel-do-opencode.git
+   cd painel-do-opencode/linux
+   ./instalar.sh
+   ```
+
+   Sem o `git`, baixe o **Source code (zip)** na página Releases, extraia e rode `./instalar.sh` dentro de `linux/`.
+3. Procure **"Painel do OpenCode"** no menu de aplicativos.
+
+Para desinstalar: `./instalar.sh --remover`.
+
+### Acesso pelo celular no Linux
+
+O painel mostra o endereço para o celular, mas o acesso pela rede e o firewall são configurados à parte:
 
 ```bash
-cd linux
-./instalar.sh            # instala para o seu usuário (sem sudo)
-./instalar.sh --remover  # desinstala
+opencode service set hostname 0.0.0.0
+sudo ufw allow from 192.168.0.0/24 to any port <porta> proto tcp   # se usar o ufw
 ```
 
-Depois, procure **"Painel do OpenCode"** no menu de aplicativos.
+Troque `192.168.0.0/24` pela faixa da sua rede e `<porta>` pela porta que o painel mostra.
+Depois, reinicie o serviço pelo painel e, no app OpenCode Mobile, adicione um servidor com o
+**endereço para o celular** e a sua senha.
 
-No Linux, o acesso pela rede e o firewall são configurados à parte. Por exemplo, com `ufw`:
-`opencode service set hostname 0.0.0.0` e `sudo ufw allow from 192.168.0.0/24 to any port <porta> proto tcp`
-(troque a faixa pela da sua rede e a porta pela que o painel mostra).
+**Gerar o `.deb` a partir do código**, dentro de `linux/`: `./gerar-deb.sh 1.0` (o pacote vai para `linux/dist/`).
 
 ## Estrutura
 
 ```
 windows/   app em Python + Qt (PySide6), empacotado como .exe com PyInstaller
-linux/     app em Python + GTK 4/libadwaita, com instalador
+linux/     app em Python + GTK 4/libadwaita, com instalador e gerador de .deb
 docs/img/  imagens deste README
 ```
 
