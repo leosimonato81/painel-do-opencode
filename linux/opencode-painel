@@ -1,0 +1,511 @@
+#!/usr/bin/env python3
+"""Painel do OpenCode: liga/desliga o serviço, mostra os endereços,
+troca a senha e escolhe o que acontece ao entrar no computador."""
+
+import hashlib
+import json
+import math
+import os
+import subprocess
+import threading
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, GLib, Gtk  # noqa: E402
+
+APP_ID = "local.opencode.Painel"
+HOME = os.path.expanduser("~")
+OC = os.path.join(HOME, ".opencode/bin/opencode")
+APP = "/opt/OpenCode/ai.opencode"
+CFG = os.path.join(HOME, ".config/opencode/service.json")
+AUTOSTART = os.path.join(HOME, ".config/autostart/opencode-inicio.desktop")
+
+MODOS = ["Com interface", "Sem interface", "Não inicia"]
+DESCRICAO = {
+    "Com interface": "Abre o app OpenCode (ele liga o serviço)",
+    "Sem interface": "Só liga o serviço, para usar pelo celular",
+    "Não inicia": "Nada liga sozinho",
+}
+SENHA_MIN = 12
+ESTADO = os.path.join(HOME, ".config/opencode-painel/estado.json")
+
+
+def ler_estado():
+    try:
+        with open(ESTADO) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def gravar_estado(**valores):
+    estado = ler_estado()
+    estado.update(valores)
+    os.makedirs(os.path.dirname(ESTADO), exist_ok=True)
+    with open(ESTADO, "w") as f:
+        json.dump(estado, f, indent=2)
+
+
+
+# Ícone: logo original do OpenCode + selo de liga/desliga, refeito quando o original muda.
+ICONE_ORIGEM = "/usr/share/icons/hicolor/{t}x{t}/apps/ai.opencode.png"
+ICONE_DESTINO = os.path.join(HOME, ".local/share/icons/hicolor/{t}x{t}/apps/" + APP_ID + ".png")
+ICONE_MARCA = os.path.join(HOME, ".cache/opencode-painel/icone.sha1")
+ICONE_TAMANHOS = (32, 64, 128)
+SELO_COR = (0.21, 0.52, 0.89)  # azul do GNOME
+
+
+def _desenhar_icone(origem, destino, t):
+    import cairo
+
+    sup = cairo.ImageSurface.create_from_png(origem)
+    cr = cairo.Context(sup)
+    r = t * 0.19                      # raio do selo
+    cx = cy = t - r - t * 0.03        # canto inferior direito
+    # borda escura, para destacar o selo do fundo
+    cr.arc(cx, cy, r + t * 0.025, 0, 2 * math.pi)
+    cr.set_source_rgba(0.08, 0.08, 0.08, 0.95)
+    cr.fill()
+    # selo
+    cr.arc(cx, cy, r, 0, 2 * math.pi)
+    cr.set_source_rgb(*SELO_COR)
+    cr.fill()
+    # símbolo de liga/desliga
+    cr.set_source_rgb(1, 1, 1)
+    cr.set_line_width(max(1.2, r * 0.17))
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.arc(cx, cy, r * 0.5, math.radians(-60), math.radians(240))
+    cr.stroke()
+    cr.move_to(cx, cy - r * 0.62)
+    cr.line_to(cx, cy - r * 0.08)
+    cr.stroke()
+    os.makedirs(os.path.dirname(destino), exist_ok=True)
+    sup.write_to_png(destino)
+
+
+def garantir_icone():
+    """Refaz o ícone só se o logo original do OpenCode mudou (ex.: atualização)."""
+    try:
+        h = hashlib.sha1()
+        existentes = []
+        for t in ICONE_TAMANHOS:
+            origem = ICONE_ORIGEM.format(t=t)
+            if os.path.isfile(origem):
+                existentes.append(t)
+                with open(origem, "rb") as f:
+                    h.update(f.read())
+        if not existentes:
+            return
+        marca = h.hexdigest()
+        faltando = any(not os.path.isfile(ICONE_DESTINO.format(t=t)) for t in existentes)
+        anterior = open(ICONE_MARCA).read().strip() if os.path.isfile(ICONE_MARCA) else ""
+        if marca == anterior and not faltando:
+            return
+        for t in existentes:
+            _desenhar_icone(ICONE_ORIGEM.format(t=t), ICONE_DESTINO.format(t=t), t)
+        os.makedirs(os.path.dirname(ICONE_MARCA), exist_ok=True)
+        with open(ICONE_MARCA, "w") as f:
+            f.write(marca)
+    except Exception as e:  # o ícone nunca pode impedir o painel de abrir
+        print(f"Aviso: não consegui atualizar o ícone: {e}")
+
+
+# ---------------------------------------------------------------- lógica
+def oc(*args):
+    try:
+        r = subprocess.run([OC, *args], capture_output=True, text=True, timeout=40, cwd=HOME)
+        return r.stdout.strip()
+    except Exception:
+        return ""
+
+
+def status_url():
+    linhas = oc("service", "status").splitlines()
+    s = linhas[0].strip() if linhas else ""
+    return None if not s or s == "stopped" else s
+
+
+def app_aberto():
+    return subprocess.run(["pgrep", "-f", f"^{APP}$"], capture_output=True).returncode == 0
+
+
+def ip_local():
+    try:
+        out = subprocess.run(["hostname", "-I"], capture_output=True, text=True).stdout.split()
+        return out[0] if out else None
+    except Exception:
+        return None
+
+
+def modo_inicio():
+    if not os.path.isfile(AUTOSTART):
+        return "Não inicia"
+    with open(AUTOSTART) as f:
+        return "Com interface" if f"Exec={APP}" in f.read() else "Sem interface"
+
+
+def gravar_modo(modo):
+    if modo == "Não inicia":
+        if os.path.exists(AUTOSTART):
+            os.remove(AUTOSTART)
+        return
+    comando = APP if modo == "Com interface" else f"{OC} service start"
+    os.makedirs(os.path.dirname(AUTOSTART), exist_ok=True)
+    with open(AUTOSTART, "w") as f:
+        f.write(
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            "Name=OpenCode (início automático)\n"
+            "Comment=Criado pelo Painel do OpenCode\n"
+            f"Exec={comando}\n"
+            "Icon=ai.opencode\n"
+            "X-GNOME-Autostart-enabled=true\n"
+            "NoDisplay=true\n"
+        )
+
+
+def gravar_senha(senha):
+    with open(CFG) as f:
+        dados = json.load(f)
+    dados["password"] = senha
+    tmp = CFG + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(dados, f, indent=2)
+    os.replace(tmp, CFG)
+
+
+def em_segundo_plano(trabalho, ao_terminar):
+    """Roda `trabalho` fora da interface e entrega o resultado em `ao_terminar`."""
+    def alvo():
+        resultado = trabalho()
+        GLib.idle_add(ao_terminar, resultado)
+    threading.Thread(target=alvo, daemon=True).start()
+
+
+# ---------------------------------------------------------------- interface
+class Painel(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Painel do OpenCode")
+        self.set_default_size(480, 660)
+        self.ocupado = False
+        self.atualizando = False
+        self.url = None
+        self.ajuda_pendente = not ler_estado().get("ajuda_celular_vista", False)
+
+        self.toasts = Adw.ToastOverlay()
+        vista = Adw.ToolbarView()
+        vista.add_top_bar(Adw.HeaderBar())
+        pagina = Adw.PreferencesPage()
+        vista.set_content(pagina)
+        self.toasts.set_child(vista)
+        self.set_content(self.toasts)
+
+        # --- Serviço
+        g = Adw.PreferencesGroup(title="Serviço")
+        self.chave = Adw.SwitchRow(title="Serviço do OpenCode", subtitle="Verificando…")
+        self.chave.add_prefix(Gtk.Image.new_from_icon_name("network-server-symbolic"))
+        self.chave.connect("notify::active", self.ao_alternar)
+        g.add(self.chave)
+
+        self.linha_reiniciar = Adw.ActionRow(title="Reiniciar", subtitle="Aplica mudanças de configuração")
+        bt = Gtk.Button(icon_name="view-refresh-symbolic", valign=Gtk.Align.CENTER, tooltip_text="Reiniciar")
+        bt.add_css_class("flat")
+        bt.connect("clicked", self.ao_reiniciar)
+        self.linha_reiniciar.add_suffix(bt)
+        self.linha_reiniciar.set_activatable_widget(bt)
+        g.add(self.linha_reiniciar)
+        pagina.add(g)
+
+        # --- Endereços
+        self.grupo_end = Adw.PreferencesGroup(title="Endereços", description="Use no navegador ou no app do celular")
+        self.linha_pc = self._linha_copiar("Neste PC")
+        self.linha_cel = self._linha_copiar("Celular (mesmo Wi-Fi)")
+        bt_ajuda = Gtk.Button(icon_name="help-about-symbolic", valign=Gtk.Align.CENTER,
+                              tooltip_text="Como configurar no celular")
+        bt_ajuda.add_css_class("flat")
+        bt_ajuda.connect("clicked", lambda *_: self.mostrar_ajuda_celular())
+        self.linha_cel.add_suffix(bt_ajuda)
+        self.grupo_end.add(self.linha_pc)
+        self.grupo_end.add(self.linha_cel)
+        pagina.add(self.grupo_end)
+
+        # --- Início automático
+        g = Adw.PreferencesGroup(title="Ao entrar no computador")
+        self.combo = Adw.ComboRow(title="Ao fazer login", model=Gtk.StringList.new(MODOS))
+        self.combo.add_prefix(Gtk.Image.new_from_icon_name("system-run-symbolic"))
+        atual = modo_inicio()
+        self.combo.set_selected(MODOS.index(atual))
+        self.combo.set_subtitle(DESCRICAO[atual])
+        self.combo.connect("notify::selected", self.ao_escolher_modo)
+        g.add(self.combo)
+        pagina.add(g)
+
+        # --- Senha
+        g = Adw.PreferencesGroup(
+            title="Trocar senha",
+            description=f"Senha do serviço. Mínimo de {SENHA_MIN} caracteres. Depois de trocar, atualize no app do celular.",
+        )
+        self.senha1 = self._campo_senha("Nova senha")
+        self.senha2 = self._campo_senha("Repita a nova senha")
+        for e in (self.senha1, self.senha2):
+            e.connect("changed", self.ao_digitar_senha)
+            g.add(e)
+        self.bt_senha = Adw.ButtonRow(title="Salvar nova senha", sensitive=False)
+        self.bt_senha.add_css_class("suggested-action")
+        self.bt_senha.connect("activated", self.ao_salvar_senha)
+        g.add(self.bt_senha)
+        pagina.add(g)
+
+        self.atualizar()
+        GLib.timeout_add_seconds(4, self._periodico)
+
+    # ----- auxiliares de interface
+    def _campo_senha(self, titulo):
+        """Campo de senha cujo botão de mostrar/ocultar só aparece depois de digitar algo."""
+        linha = Adw.EntryRow(title=titulo)
+        texto = linha.get_delegate()
+        texto.set_visibility(False)
+        texto.set_input_purpose(Gtk.InputPurpose.PASSWORD)
+
+        olho = Gtk.ToggleButton(icon_name="view-reveal-symbolic", valign=Gtk.Align.CENTER,
+                                tooltip_text="Mostrar senha", visible=False)
+        olho.add_css_class("flat")
+
+        def alternar(bt):
+            texto.set_visibility(bt.get_active())
+            bt.set_icon_name("view-conceal-symbolic" if bt.get_active() else "view-reveal-symbolic")
+            bt.set_tooltip_text("Ocultar senha" if bt.get_active() else "Mostrar senha")
+
+        def ao_mudar(_linha):
+            tem_texto = bool(linha.get_text())
+            olho.set_visible(tem_texto)
+            if not tem_texto and olho.get_active():
+                olho.set_active(False)  # volta a ocultar quando o campo é apagado
+
+        olho.connect("toggled", alternar)
+        linha.connect("changed", ao_mudar)
+        linha.add_suffix(olho)
+        return linha
+
+    def _linha_copiar(self, titulo):
+        linha = Adw.ActionRow(title=titulo, subtitle="—")
+        linha.add_css_class("property")
+        bt = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER, tooltip_text="Copiar")
+        bt.add_css_class("flat")
+        bt.connect("clicked", lambda *_: self._copiar(linha.get_subtitle()))
+        linha.add_suffix(bt)
+        return linha
+
+    def _copiar(self, texto):
+        if texto and texto != "—":
+            Gdk.Display.get_default().get_clipboard().set(texto)
+            self.aviso("Endereço copiado")
+
+    def aviso(self, texto):
+        self.toasts.add_toast(Adw.Toast(title=texto, timeout=3))
+
+    def _periodico(self):
+        if not self.ocupado:
+            self.atualizar()
+        return True
+
+    # ----- estado do serviço
+    def atualizar(self):
+        em_segundo_plano(status_url, self._mostrar_status)
+
+    def _mostrar_status(self, url):
+        if self.ocupado:
+            return False
+        self.url = url
+        ligado = url is not None
+        self.atualizando = True
+        self.chave.set_active(ligado)
+        self.atualizando = False
+        self.chave.set_subtitle("Ligado" if ligado else "Desligado")
+        self.linha_reiniciar.set_sensitive(ligado)
+        self.grupo_end.set_visible(ligado)
+        if ligado:
+            porta = url.rsplit(":", 1)[-1]
+            self.linha_pc.set_subtitle(f"http://127.0.0.1:{porta}")
+            ip = ip_local()
+            self.linha_cel.set_subtitle(f"http://{ip}:{porta}" if ip else "Sem rede")
+        if self.ajuda_pendente:  # primeira vez que o painel abre
+            self.ajuda_pendente = False
+            GLib.timeout_add(300, lambda: self.mostrar_ajuda_celular(primeira_vez=True) and False)
+        return False
+
+    # ----- ajuda: configurar no celular
+    def _endereco_celular(self):
+        if not self.url:
+            return None
+        ip = ip_local()
+        return f"http://{ip}:{self.url.rsplit(':', 1)[-1]}" if ip else None
+
+    def _linha_info(self, titulo, valor, copiar=True):
+        linha = Adw.ActionRow(title=titulo, subtitle=valor)
+        linha.add_css_class("property")
+        if copiar:
+            bt = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER, tooltip_text="Copiar")
+            bt.add_css_class("flat")
+            bt.connect("clicked", lambda *_: self._copiar(valor))
+            linha.add_suffix(bt)
+        return linha
+
+    def mostrar_ajuda_celular(self, primeira_vez=False):
+        end = self._endereco_celular()
+        pagina = Adw.PreferencesPage()
+
+        if primeira_vez:
+            g = Adw.PreferencesGroup(
+                title="Bem-vindo! 👋",
+                description="Este guia mostra como acessar o OpenCode pelo celular. "
+                            "Ele fica disponível depois no botão ⓘ ao lado do endereço do celular.",
+            )
+            pagina.add(g)
+
+        g = Adw.PreferencesGroup(title="Antes de começar")
+        g.add(Adw.ActionRow(title="Celular no mesmo Wi-Fi do PC",
+                            subtitle="Fora de casa não funciona sem uma VPN como o Tailscale"))
+        estado = "Ligado ✓" if end else "Desligado — ligue no interruptor do painel"
+        g.add(Adw.ActionRow(title="Serviço ligado", subtitle=estado))
+        pagina.add(g)
+
+        # Opção 1: o app que o usuário já usa
+        g = Adw.PreferencesGroup(
+            title="Pelo app OpenCode Mobile",
+            description="O app da Play Store. Configure uma vez; depois é só abrir. "
+                        "Melhor para o dia a dia.",
+        )
+        g.add(self._linha_info("Nome", "Escolha o que quiser (ex.: PC de casa)", copiar=False))
+        g.add(self._linha_info("Endereço do servidor", end or "Ligue o serviço para ver", copiar=bool(end)))
+        g.add(self._linha_info("Senha", "A que você definiu (seção Trocar senha)", copiar=False))
+        pagina.add(g)
+
+        g = Adw.PreferencesGroup(title="Não conectou?")
+        if end:
+            g.add(self._linha_info("Teste no navegador do celular", f"{end}/global/health"))
+        g.add(Adw.ActionRow(title="Firewall", subtitle="A porta precisa estar liberada para a sua rede (já está)"))
+        g.add(Adw.ActionRow(title="IP mudou?", subtitle="O roteador pode trocar o IP do PC. Confira o endereço aqui no painel."))
+        pagina.add(g)
+
+        vista = Adw.ToolbarView()
+        vista.add_top_bar(Adw.HeaderBar())
+        vista.set_content(pagina)
+        bt = Gtk.Button(label="Entendi", halign=Gtk.Align.CENTER, margin_top=6, margin_bottom=12)
+        bt.add_css_class("pill")
+        bt.add_css_class("suggested-action")
+        vista.add_bottom_bar(bt)
+
+        dialogo = Adw.Dialog(title="Configurar no celular", content_width=440, content_height=640)
+        dialogo.set_child(vista)
+        bt.connect("clicked", lambda *_: dialogo.close())
+        dialogo.connect("closed", lambda *_: gravar_estado(ajuda_celular_vista=True))
+        dialogo.present(self)
+        return False
+
+    def _executar(self, rotulo, args, mensagem_ok, conferir):
+        self.ocupado = True
+        self.chave.set_sensitive(False)
+        self.linha_reiniciar.set_sensitive(False)
+        self.chave.set_subtitle(rotulo)
+
+        def trabalho():
+            oc(*args)
+            return status_url()
+
+        def fim(url):
+            self.ocupado = False
+            self.chave.set_sensitive(True)
+            self._mostrar_status(url)
+            self.aviso(mensagem_ok if conferir(url) else "Não funcionou como esperado — veja o status")
+            return False
+
+        em_segundo_plano(trabalho, fim)
+
+    # ----- ações
+    def ao_alternar(self, *_):
+        if self.atualizando or self.ocupado:
+            return
+        if self.chave.get_active():
+            self._executar("Ligando…", ("service", "start"), "Serviço ligado", lambda u: u is not None)
+        elif app_aberto():
+            self._confirmar_desligar()
+        else:
+            self._desligar()
+
+    def _desligar(self):
+        self._executar("Desligando…", ("service", "stop"), "Serviço desligado", lambda u: u is None)
+
+    def _confirmar_desligar(self):
+        d = Adw.AlertDialog(
+            heading="O app OpenCode está aberto",
+            body="Ele religa o serviço sozinho. Feche o app antes de desligar.",
+        )
+        d.add_response("cancelar", "Cancelar")
+        d.add_response("desligar", "Desligar mesmo assim")
+        d.set_response_appearance("desligar", Adw.ResponseAppearance.DESTRUCTIVE)
+        d.set_default_response("cancelar")
+
+        def resposta(_d, r):
+            if r == "desligar":
+                self._desligar()
+            else:
+                self.atualizar()
+
+        d.connect("response", resposta)
+        d.present(self)
+
+    def ao_reiniciar(self, *_):
+        if not self.ocupado:
+            self._executar("Reiniciando…", ("service", "restart"), "Serviço reiniciado", lambda u: u is not None)
+
+    def ao_escolher_modo(self, *_):
+        modo = MODOS[self.combo.get_selected()]
+        try:
+            gravar_modo(modo)
+        except OSError as e:
+            self.aviso(f"Erro ao salvar: {e.strerror}")
+            return
+        self.combo.set_subtitle(DESCRICAO[modo])
+        self.aviso(f"Ao entrar no computador: {modo}")
+
+    def ao_digitar_senha(self, *_):
+        s1, s2 = self.senha1.get_text(), self.senha2.get_text()
+        self.bt_senha.set_sensitive(len(s1) >= SENHA_MIN and s1 == s2)
+        if s2 and s1 != s2:
+            self.senha2.add_css_class("error")
+        else:
+            self.senha2.remove_css_class("error")
+
+    def ao_salvar_senha(self, *_):
+        senha = self.senha1.get_text()
+        try:
+            gravar_senha(senha)
+        except (OSError, ValueError) as e:
+            self.aviso(f"Erro ao salvar a senha: {e}")
+            return
+        self.senha1.set_text("")
+        self.senha2.set_text("")
+        if self.url:
+            self._executar("Reiniciando…", ("service", "restart"),
+                           "Senha trocada — atualize no celular", lambda u: u is not None)
+        else:
+            self.aviso("Senha trocada — vale quando o serviço ligar")
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID)
+
+    def do_activate(self):
+        janela = self.get_active_window() or Painel(self)
+        janela.present()
+
+
+if __name__ == "__main__":
+    garantir_icone()
+    Gtk.Window.set_default_icon_name(APP_ID)
+    App().run(None)

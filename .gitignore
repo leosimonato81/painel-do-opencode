@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# PyInstaller (o .exe vai para a página Releases, não para o repositório)
+build/
+dist/
+*.spec
